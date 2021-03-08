@@ -1,0 +1,1483 @@
+import pandas as pd
+import sys
+import re
+import os
+import math
+import shutil
+from snakemake.utils import min_version
+from osr import gunzip
+from osr import get_contrast_fnames, get_contrast_groups, get_dict_from_meta, G2B_workflow
+from osr import DESeq2_input, input_rnk_fname1, input_rnk_fname2
+from osr import get_strandness, get_strandness_for_dexseq, get_strandness_for_hisat2_PE, \
+get_strandness_for_hisat2_SE, get_strandness_for_stringtie
+from osr import read_length
+
+###  Usage Requirements  ###
+# inputs in ./fastq/
+# named as {sample}.R1.fastq.gz {sample}.R2.fastq.gz for PE reads
+# {sample}.fastq.gz for PE reads
+
+# SnakeMake Coding Notes:
+# input don't have to be used, just for draw nice DAG
+# 07/10/2019 randomized primary alignment
+
+
+min_version("5.17.0")  # check snakemake version
+configfile: "config.yaml"
+ruleorder: create_dag > DESeq2 > GSEA  > rMATS > FastQC > bam_qc > bamCoverage > feature_count  > samtools_sort > samtools_index > reset
+# container: "workflow/envs/hand_sandbox.simg"  # only effective when --use-singularity
+# removed gloabal singularity so that can use --use-singularity and --use-conda at the same time
+# localrules: targets, create_dag
+# priority 0-100, default 0
+# shell.prefix("""
+#             # - alias does not work, have to use $samstat
+#             # module load star/2.5.3a
+#             # module load singularity/singularity-current
+#             # conda activate osr  # have to create conda env osr first
+#             """)
+
+
+# umcompress files (todo: make it a rule)
+if config["GENOME"].endswith(".gz"):
+    gunzip(config["GENOME"])
+    config["GENOME"] = re.sub(".gz$", "", config["GENOME"])
+
+if config["GTF"].endswith(".gz"):
+    gunzip(config["GTF"])
+    config["GTF"] = re.sub(".gz$", "", config["GTF"])
+
+if config["VCF"].endswith(".gz"):
+    gunzip(config["VCF"])
+    config["VCF"] = re.sub(".gz$", "", config["VCF"])
+
+
+# params
+WORKDIR=config['PROJECT_DIR']
+TMP=tmp=WORKDIR+"/tmp"
+REZ=rez=WORKDIR+"/rez"
+SAMPLES=config['SAMPLES']
+GENOME=config["GENOME"]
+INDEX=config["INDEX"]
+GTF=config["GTF"]
+ANNO_TAB=config["ANNO_TAB"]
+STRAND=config["STRAND"]
+MODE=config["MODE"]
+MAX_FDR=config["MAX_FDR"]
+MIN_LFC=config["MIN_LFC"]
+MIN_GENE_COUNT= config["MIN_GENE_COUNT"] if 'MIN_GENE_COUNT' in config else 100  # DEXSeq
+
+
+# for DESeq2
+if config['DESEQ2_ANALYSIS'] and config['START'] in ["FASTQ", "BAM", "COUNT"]:
+    CONTRASTS_DE = get_contrast_fnames(config['CONTRAST_DE'])
+    #print("CONTRASTS_DE:\n", CONTRASTS_DE)
+else:
+    CONTRASTS_DE = ["placeholder"]
+
+# for DEXSeq
+if config['DEXSEQ_ANALYSIS'] and config["START"] in ["FASTQ", "BAM"]:
+    CONTRASTS_AS = get_contrast_fnames(config['CONTRAST_AS'])
+else:
+    CONTRASTS_AS = ["placeholder"]
+CONTRASTS_AS = [l.replace('.','_') for l in CONTRASTS_DE]
+
+
+# for rMATS
+if config['RMATS_ANALYSIS'] and config['START'] in ["FASTQ", "BAM"]:
+    G = get_contrast_groups(config['CONTRAST_AS'])
+    #print("\nGRPUPS:\n", G[0], "\nVS\n", G[1])
+
+    g2s = get_dict_from_meta(config['META'])
+    #print("\nGroup To Sample Mapping:\n", g2s)
+
+    B1S, B1 = G2B_workflow(G[0], g2s)
+    B2S, B2 = G2B_workflow(G[1], g2s)
+
+    # print("\nrMATS -b1:\n", B1)
+    # print("B1S:", B1S)
+    # print("rMATS -b2:\n", B2)
+    # print("B2S:", B2S)
+
+    # Get contrast for rMATS
+    df2 = pd.read_excel(config['CONTRAST_AS'], engine='openpyxl')
+    ASCN = df2.shape[1] # alternative splicing contrast count
+    #print("ASCN", ASCN)
+else:
+    B1 = "placeholder.bam"
+    B1S = ["placeholder"]
+    B2 = B1
+    B2S = B1S
+    ASCN = 0
+
+
+
+
+
+
+
+def GSEA_OUTPUT(config):
+    if config["GSEA_ANALYSIS"]:
+        if config["START"] in ["FASTQ", "BAM", "COUNT"]:
+            return(expand("gsea/{contrast}/{db}.GseaPreranked/index.html", contrast=CONTRASTS_DE, db=config["GSEA_DBS"]))
+        else:
+            return(expand("gsea/{contrast}/{db}.GseaPreranked/index.html", contrast=config["RNKS"], db=config["GSEA_DBS"]))
+    else:
+        return("Workflow_DAG.all.svg")
+
+rule targets:
+    input:
+        # 1. everything listed here will be produced by the pipeline
+        # 2. feed {sample}
+        fastqc=("fastqc/multiqc_report.html" 
+            if config["START"] == "FASTQ" 
+            else "Workflow_DAG.all.svg"),
+
+        STAR_Align_multiqc=(rez+"/bam_qc/STAR_Align_summary_multiqc_report.html"
+            if config["START"] == "FASTQ" # todo: only when STAR used as aligner
+            else "Workflow_DAG.all.svg"),
+
+        bam_qc=(expand(rez+"/bam_qc/idxstats/{sample}.idxstats.txt", sample=SAMPLES) 
+            if config["START"] in ["FASTQ", "BAM"]  
+            else "Workflow_DAG.all.svg"),
+
+        bam_qc_multiqc=(rez+"/bam_qc/samtools_stats_multiqc_report.html"
+            if config['START'] in ['FASTQ', 'BAM']
+            else 'Workflow_DAG.all.svg'),
+
+        QoRTs=(expand(rez+"/bam_qc/QoRTs/{sample}/QC.QORTS_COMPLETED_OK", sample=SAMPLES)
+            if config["START"] in ["FASTQ", "BAM"]  
+            else "Workflow_DAG.all.svg"),
+
+        QoRTs_MultiPlot=(rez+"/bam_qc/QoRTs_MultiPlot/plot-basic.pdf"
+            if config["START"] in ["FASTQ", "BAM"]  
+            else "Workflow_DAG.all.svg"),
+
+        bamCoverage=(expand("bigWig/{sample}.{mode}.cpm.bw", sample=SAMPLES, mode=MODE) 
+            if config["START"] in ["FASTQ", "BAM"]  
+            else "Workflow_DAG.all.svg"),
+
+        feature_count_strict=(expand("feature_count/counts.s{strand}.strict.txt", strand=STRAND)
+            if config["START"] in ["FASTQ", "BAM"] and config["MODE"] == "strict"
+            else "Workflow_DAG.all.svg"),
+
+        feature_count_liberal=(expand("feature_count/counts.s{strand}.liberal.txt", strand=STRAND)       
+            if config["START"] in ["FASTQ", "BAM"] and config["MODE"] == "liberal"
+            else "Workflow_DAG.all.svg"),
+
+        feature_count_gene_strict=(expand('feature_count_gene_level/counts.s{strand}.gene_level.strict.txt', strand=STRAND)
+            if config["START"] in ["FASTQ", "BAM"] and config["MODE"] == "strict" and config['INTRON']
+            else "Workflow_DAG.all.svg"),
+
+        feature_count_gene_liberal=(expand('feature_count_gene_level/counts.s{strand}.gene_level.liberal.txt', strand=STRAND)
+            if config["START"] in ["FASTQ", "BAM"] and config["MODE"] == "liberal" and config['INTRON']
+            else "Workflow_DAG.all.svg"),
+
+        DESeq2="DESeq2/DESeq2.html"
+            if config["START"] in ["FASTQ", "BAM", "COUNT"] and config['DESEQ2_ANALYSIS']
+            else "Workflow_DAG.all.svg",
+
+        GSEA = GSEA_OUTPUT(config),
+
+        rMATS=expand("rMATS.{ascn}/output/Results_JunctionCountsBased/RI.MATS.JC.txt", ascn=range(1, 1+ASCN))
+            if config['RMATS_ANALYSIS'] and config["START"] in ["FASTQ", "BAM"] 
+            else "Workflow_DAG.all.svg",
+
+        DEXSeq_count=expand("DEXSeq_count/{sample}_count.txt", sample=SAMPLES)
+            if config['DEXSEQ_ANALYSIS'] and config["START"] in ["FASTQ", "BAM"]
+            else "Workflow_DAG.all.svg",
+
+        DEXSeq=expand("DEXSeq/contrast{ascn}/contrast{ascn}.RData", ascn=range(1,ASCN+1))
+            if config['DEXSEQ_ANALYSIS'] and config["START"] in ["FASTQ", "BAM"]
+            else "Workflow_DAG.all.svg",
+
+        SalmonTE=("SalmonTE_output/EXPR.csv"
+            if config['TE_ANALYSIS'] and config["START"] == "FASTQ"
+            else "Workflow_DAG.all.svg"),
+
+        #CUFFMERGE='cuffmerge/merged.gtf' if config["ASSEMBLY_ANALYSIS"] and config["START"] in ["FASTQ"] else "Workflow_DAG.all.svg",
+
+        stringtie='stringtie/stringtie.merged.gtf' if config["ASSEMBLY_ANALYSIS"] and config["START"] in ["FASTQ"] else "Workflow_DAG.all.svg",
+
+        GATK_ASE=(expand("GATK_ASEReadCounter/{sample}.table", sample=SAMPLES)
+            if config["ASE_ANALYSIS"] and config["START"] in ["FASTQ", "BAM"]
+            else "Workflow_DAG.all.svg"),
+
+        dag="Workflow_DAG.all.svg", # create DAG
+#        organize_results="log/oranize_results.finished",
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 1000   
+
+## fastqc
+if config["PAIR_END"]:
+    rule FastQC:
+        # don't need input, if you agree on not checking them
+        # without output, output will not be created
+        input:
+            r1="fastq/{sample}.R1.fastq.gz",
+            r2="fastq/{sample}.R2.fastq.gz",
+        output:
+            r1="fastqc/details/{sample}.R1_fastqc.html", 
+            r2="fastqc/details/{sample}.R2_fastqc.html" 
+        priority:
+            10
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000   
+        threads:
+            1
+        log:
+            "log/fastqc/{sample}.log"
+        benchmark:
+            "log/fastqc/{sample}.tsv"
+        shell:
+            "which fastqc &> {log};"
+            "fastqc -t {threads} {input} -o fastqc/details &>> {log};"
+else:
+    rule FastQC:
+        # don't need input, if you agree on not checking them
+        # without output, output will not be created
+        input:
+            r1="fastq/{sample}.fastq.gz" 
+        output:
+            "fastqc/details/{sample}_fastqc.html"
+        priority:
+            10
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000   
+        threads:
+            1
+        log:
+            "log/fastqc/{sample}.log"
+        benchmark:
+            "log/fastqc/{sample}.tsv"
+        shell:
+            "which fastqc &> {log};"
+            "fastqc -t {threads} {input} -o fastqc/details &>> {log};"
+
+
+# rule MultiQC
+if config["PAIR_END"]:
+    rule MultiQC:
+        input:
+            r1=expand("fastqc/details/{sample}.R1_fastqc.html", sample=SAMPLES),
+            r2=expand("fastqc/details/{sample}.R2_fastqc.html", sample=SAMPLES) 
+        output:
+            "fastqc/multiqc_report.html"
+        priority:
+            10
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000   
+        threads:
+            1
+        log:
+            "log/multiqc/multiqc.log"
+        benchmark:
+            "log/multiqc/multiqc.tsv"
+        shell:
+            "which multiqc &> {log};"
+            "rm -rf fastqc/multiqc_data && multiqc fastqc/details -o fastqc &>> {log};"
+            "D=fastqc; rm  -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};"
+else:
+    rule MultiQC:
+        input:
+            r1=expand("fastqc/details/{sample}_fastqc.html", sample=SAMPLES),
+            r2=expand("fastqc/details/{sample}_fastqc.html", sample=SAMPLES), # trick snakemake to skip r2
+        output:
+            "fastqc/multiqc_report.html"
+        priority:
+            10
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000   
+        threads:
+            1
+        log:
+            "log/multiqc/multiqc.log"
+        benchmark:
+            "log/multiqc/multiqc.tsv"
+        shell:
+            "which multiqc &> {log};"
+            "rm -rf fastqc/multiqc_data && multiqc fastqc/details -o fastqc &>> {log};"
+            "D=fastqc; rm  -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};"
+
+
+rule star_idx:
+    input:
+        fa=GENOME,
+        gtf=GTF,
+    output:
+        INDEX+"/SAindex"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 6400   
+    threads:
+        6
+    log:
+        "log/star_idx/star_idx.log"
+    benchmark:
+        "log/star_idx/star_idx.tsv"
+    # envmodules:
+    #     "star/2.7.5a"
+    shell:
+        """
+        whoami > {log};
+        which STAR >> {log};
+
+        STAR --runThreadN {threads} \
+        --runMode genomeGenerate \
+        --genomeDir {INDEX} \
+        --genomeFastaFiles {input.fa} \
+        --sjdbGTFfile {input.gtf} &>> {log}
+        """
+
+
+# rule STAR_Align
+if config['PAIR_END']:
+    rule STAR_Align:
+        input:
+            index=INDEX+"/SAindex",
+            gtf=GTF,
+            r1="fastq/{sample}.R1.fastq.gz",
+            r2="fastq/{sample}.R2.fastq.gz"
+        output:
+            log="mapped_reads/{sample}.Log.final.out",
+            bam=temp("mapped_reads/{sample}.bam"),
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 3000 
+        params:
+            reads="fastq/{sample}.R1.fastq.gz fastq/{sample}.R2.fastq.gz"
+        threads:
+            12
+        log:
+            "log/mapped_reads/{sample}.star.log"
+        benchmark:
+            "log/mapped_reads/{sample}.star.tsv"
+        # envmodules:
+        #     "star/2.7.5a"
+        shell:
+            """
+            which STAR > {log};
+            STAR --runThreadN {threads} \
+            --genomeDir {INDEX} \
+            --sjdbGTFfile {input.gtf} \
+            --readFilesCommand zcat \
+            --readFilesIn {params.reads} \
+            --outFileNamePrefix mapped_reads/{wildcards.sample}. \
+            --outFilterType BySJout \
+            --outMultimapperOrder Random \
+            --outFilterMultimapNmax 200 \
+            --alignSJoverhangMin 8 \
+            --alignSJDBoverhangMin 3 \
+            --outFilterMismatchNmax 999 \
+            --outFilterMismatchNoverReadLmax 0.05 \
+            --alignIntronMin 20 \
+            --alignIntronMax 1000000 \
+            --alignMatesGapMax 1000000 \
+            --outFilterIntronMotifs RemoveNoncanonicalUnannotated \
+            --outSAMstrandField None \
+            --outSAMtype BAM Unsorted \
+            --quantMode GeneCounts \
+            --outReadsUnmapped Fastx \
+            >> {log} 2>&1
+
+            mv mapped_reads/{wildcards.sample}.Aligned.out.bam mapped_reads/{wildcards.sample}.bam &>> {log}
+            pigz -p {threads} -f mapped_reads/{wildcards.sample}.Unmapped.out.mate*  &>> {log}
+            """
+else:
+    rule STAR_Align:
+        input:
+            index=INDEX+"/SAindex",
+            gtf=GTF,
+            r1="fastq/{sample}.fastq.gz",
+        output:
+            temp("mapped_reads/{sample}.bam"),
+            "mapped_reads/{sample}.Log.final.out"
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 3000   ,
+        params:
+            reads="fastq/{sample}.fastq.gz",
+        threads:
+            12
+        log:
+            "log/mapped_reads/{sample}.star.log"
+        benchmark:
+            "log/mapped_reads/{sample}.star.tsv"
+        # envmodules:
+        #     "star/2.7.5a"
+        shell:
+            """
+            # todo: documentation for liberal mode: STAR->featureCounts
+            which STAR > {log};
+            STAR --runThreadN {threads} \
+            --genomeDir {INDEX} \
+            --sjdbGTFfile {input.gtf} \
+            --readFilesCommand zcat \
+            --readFilesIn {params.reads} \
+            --outFileNamePrefix mapped_reads/{wildcards.sample}. \
+            --outFilterType BySJout \
+            --outMultimapperOrder Random \
+            --outFilterMultimapNmax 200 \
+            --alignSJoverhangMin 8 \
+            --alignSJDBoverhangMin 3 \
+            --outFilterMismatchNmax 999 \
+            --outFilterMismatchNoverReadLmax 0.05 \
+            --alignIntronMin 20 \
+            --alignIntronMax 1000000 \
+            --outFilterIntronMotifs RemoveNoncanonicalUnannotated \
+            --outSAMstrandField None \
+            --outSAMtype BAM Unsorted \
+            --quantMode GeneCounts \
+            --outReadsUnmapped Fastx \
+            >> {log} 2>&1
+
+            mv mapped_reads/{wildcards.sample}.Aligned.out.bam mapped_reads/{wildcards.sample}.bam
+            pigz -p {threads} -f mapped_reads/{wildcards.sample}.Unmapped.out.mate*
+            """
+
+rule STAR_Align_multiqc:
+    input:
+        expand("mapped_reads/{sample}.Log.final.out", sample=SAMPLES)
+    output:
+        expand(rez+"/bam_qc/STAR_Align_summary/{sample}.Log.final.out", sample=SAMPLES),
+        rez+"/bam_qc/STAR_Align_summary_multiqc_report.html",    
+    resources:
+        mem_mb="2000"
+    threads:
+        1
+    params:
+        out_dir=rez+"/bam_qc"
+    log:
+        'log/bam_qc/STAR_Align_summary_multiqc_report.log'
+    benchmark:
+        'log/bam_qc/STAR_Align_summary_multiqc_report.tsv'
+    shell:
+        """
+        mkdir -p {params.out_dir}/STAR_Align_summary/
+        cp {input} {params.out_dir}/STAR_Align_summary/
+
+        multiqc {input}  --outdir {params.out_dir} --title STAR_Align_summary
+        """
+
+
+rule samtools_sort:
+    input:
+        "mapped_reads/{sample}.bam"
+    output:
+        "sorted_reads/{sample}.bam"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000 
+    threads:
+        4
+    log:
+        "log/samtools_sort/{sample}.sort.log"
+    benchmark:
+        "log/samtools_sort/{sample}.sort.tsv"
+    shell:
+        "which samtools &> {log};"
+        "samtools sort -@ {threads} -m 3G {input} -o {output} &>> {log}"
+
+
+rule samtools_index:
+    input:
+        "sorted_reads/{sample}.bam"
+    output:
+        "sorted_reads/{sample}.bam.bai"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 2000
+    threads:
+        1
+    log:
+        "log/samtools_index/{sample}.index.log"
+    benchmark:
+        "log/samtools_index/{sample}.index.tsv"
+    shell:
+        "which samtools &> {log};"
+        "samtools index -@ {threads} {input} &>> {log}"
+
+rule bam_qc:
+    """
+    with samtools
+    """
+    input:
+        bam="sorted_reads/{sample}.bam",
+        bai="sorted_reads/{sample}.bam.bai"
+    output:
+        stats=rez+"/bam_qc/stats/{sample}.stats.txt",
+        idxstats=rez+"/bam_qc/idxstats/{sample}.idxstats.txt",
+    priority:
+        0
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 2000
+    threads:
+        2
+    log:
+        idxstats="log/bam_qc/idxstats/{sample}.idxstats.log",
+        stats="log/bam_qc/stats/{sample}.stats.log",
+    benchmark:
+        "log/bam_qc/benchmark/{sample}.bam_qc.tsv",
+    shell:
+        """
+        samtools idxstats {input.bam} > {output.idxstats} 2> {log.idxstats} &
+        samtools stats {input.bam} > {output.stats} 2> {log.stats} &
+
+        wait
+        """
+
+rule bam_qc_multiqc:
+    input:
+        stats=expand(rez+"/bam_qc/stats/{sample}.stats.txt", sample=SAMPLES),
+        idxstats=expand(rez+"/bam_qc/idxstats/{sample}.idxstats.txt", sample=SAMPLES)
+    output:
+        rez+"/bam_qc/samtools_stats_multiqc_report.html",    
+        rez+"/bam_qc/samtools_idxstats_multiqc_report.html",   
+    params:
+        out_dir=rez+"/bam_qc"
+    resources:
+        mem_mb="2000"
+    threads:
+        1
+    log:
+        'log/bam_qc/samtools_multiqc_report.log'
+    benchmark:
+        'log/bam_qc/samtools_multiqc_report.tsv'
+    shell:
+        """
+        multiqc {input.stats}  --outdir {params.out_dir} --title samtools_stats &> {log}
+        multiqc {input.idxstats}  --outdir {params.out_dir} --title samtools_idxstats &> {log}
+        """
+
+
+
+# rule QoRTs
+if config['PAIR_END']:
+    rule QoRTs:
+        input:
+            bam="sorted_reads/{sample}.bam",
+            gtf=config['GTF']
+        output:
+            rez+"/bam_qc/QoRTs/{sample}/QC.QORTS_COMPLETED_OK"
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 16500
+        params:
+            out_dir=rez + "/bam_qc/QoRTs/{sample}"
+        threads:
+            1
+        log:
+            "log/QoRTs/QoRTs.{sample}.log"
+        benchmark:
+            "log/QoRTs/QoRTs.{sample}.tsv"
+        shell:
+            """
+            which java &> {log}
+            java -Xmx16G -jar workflow/envs/hartleys-QoRTs-099881f/QoRTs.jar QC \
+            {input.bam} {input.gtf} {params.out_dir}/  &>> {log}
+            """
+else:
+    rule QoRTs:
+        input:
+            bam="sorted_reads/{sample}.bam",
+            gtf=config['GTF']
+        output:
+            rez+"/bam_qc/QoRTs/{sample}/QC.QORTS_COMPLETED_OK"
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 16500
+        threads:
+            1
+        log:
+            "log/QoRTs/QoRTs.{sample}.log"
+        benchmark:
+            "log/QoRTs/QoRTs.{sample}.tsv"
+        params:
+            out_dir=rez + "/bam_qc/QoRTs/{sample}"
+        shell:
+            """
+            which java &> {log}
+            java -Xmx16G -jar workflow/envs/hartleys-QoRTs-099881f/QoRTs.jar QC --singleEnded \
+            {input.bam}{params.out_dir} {input.gtf} {params.out_dir}/ &>> {log}
+            """
+
+
+rule get_meta_xls:
+    input:
+        "meta/meta.xlsx"
+    output:
+        "meta/decoder.txt"
+    log:
+        "log/meta_to_decoder.log"
+    shell:
+        """
+            which python  &> {log};
+            python workflow/script/meta_to_decoder.py -i {input} -o {output} &>> {log};
+        """
+
+rule QoRTs_MultiPlot:
+    input:
+        qrts = expand(rez+"/bam_qc/QoRTs/{sample}/QC.QORTS_COMPLETED_OK", sample=SAMPLES),
+        decoder = "meta/decoder.txt"
+    output:
+        rez+"/bam_qc/QoRTs_MultiPlot/plot-basic.pdf"
+    params:
+        out_dir=rez + "/bam_qc/QoRTs_MultiPlot/",
+        out_pref=rez + "/bam_qc",
+        qrts_dir = rez+"/bam_qc/QoRTs/"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 8000   ,
+    threads:
+        2
+    log:
+        "log/QoRTs/multiplot.log"
+    benchmark:
+        "log/QoRTs/multiplot.tsv"
+    shell:
+        """
+        which Rscript &> {log};
+Rscript workflow/script/QoRT.R -d {input.decoder} -q {params.qrts_dir} -o {params.out_dir}  &>> {log}; # needs QoRT package in R
+mkdir -p {params.out_dir}/details/;
+cp {params.out_dir}/plot-sample* {params.out_dir}/details/;
+D={params.out_pref}  ; # todo: more robust rule in case other bam_qc finishes faster (highly unlikely)
+rm -f $D/bam_qc.zip && [ -d $D ] && zip -rq  $D/bam_qc.zip $D/ 
+        """
+
+
+rule bamCoverage:
+    # osr
+    input:
+        bam="sorted_reads/{sample}.bam",
+        bai="sorted_reads/{sample}.bam.bai"
+    output:
+        "bigWig/{sample}.{mode}.cpm.bw"
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 16000,
+    priority:
+        0
+    log:
+        "log/bamCoverage/{sample}.{mode}.bamCoverage.log"
+    benchmark:
+        "log/bamCoverage/{sample}.{mode}.bamCoverage.tsv"
+    # not installed in hand_sandbox yet
+    run:
+        if {wildcards.mode} == "strict":
+            shell("""
+            echo '{output}'
+            which bamCoverage &> {log}
+            bamCoverage --bam {input.bam} \
+            -o  {output} \
+            --numberOfProcessors {threads} \
+            --outFileFormat bigwig --normalizeUsing CPM --binSize 10 \
+            --minMappingQuality 20 &>> {log}
+            """)
+        else:
+            shell("""
+            echo '{output}'
+            which bamCoverage &> {log}
+            bamCoverage --bam {input.bam} \
+            -o  {output} \
+            --numberOfProcessors {threads} \
+            --outFileFormat bigwig --normalizeUsing CPM --binSize 10  &>> {log}
+            """)
+
+
+
+rule feature_count:
+    input:
+        bams=expand("mapped_reads/{sample}.bam", sample=SAMPLES), # sort by name -> faster
+        gtf=GTF
+    output:
+        COUNT="feature_count/counts.s{strand}.strict.txt" if config["MODE"] == "strict" else "feature_count/counts.s{strand}.liberal.txt",
+        summary="feature_count/counts.s{strand}.strict.txt.summary" if config["MODE"] == "strict" else "feature_count/counts.s{strand}.liberal.txt.summary",
+    priority:
+        100
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000,
+    threads:
+        4
+    log:
+        "log/feature_count/counts.s{strand}.log"
+    benchmark:
+        "log/feature_count/benchmark.s{strand}.tsv"
+    run:
+        if config["PAIR_END"]:
+            if config["MODE"] == "strict":
+                shell("""
+                which featureCounts &> {log}
+                featureCounts -a {input.gtf} -o {output.COUNT} \
+                -T {threads} \
+                -g gene_id -Q 20 --minOverlap 1 --fracOverlap 0 \
+                -p -B -C  \
+                -s {wildcards.strand} \
+                {input.bams} &>> {log}
+                """)
+            elif config["MODE"] == "liberal":
+                shell("""
+                which featureCounts &> {log}
+                featureCounts -a {input.gtf} -o {output.COUNT} \
+                -T {threads} \
+                -g gene_id -M --primary -Q 0 --minOverlap 1 --fracOverlap 0 \
+                -p \
+                -s {wildcards.strand} \
+                {input.bams} &>> {log}
+                """)
+            else:
+                print ("MODE err, not liberal nor strict")
+        else:
+            if config["MODE"] == "strict":
+                shell("""
+                which featureCounts &> {log}
+                featureCounts -a {input.gtf} -o {output.COUNT} \
+                -T {threads} \
+                -g gene_id -Q 20 --minOverlap 1 --fracOverlap 0 \
+                -s {wildcards.strand} \
+                {input.bams} &>> {log}
+                """)
+            elif config["MODE"] == "liberal":
+                shell("""
+                which featureCounts &> {log}
+                featureCounts -a {input.gtf} -o {output.COUNT} \
+                -T {threads} \
+                -g gene_id -M --primary -Q 0 --minOverlap 1 --fracOverlap 0 \
+                -s {wildcards.strand} \
+                {input.bams} &>> {log}
+                """)
+            else:
+                print ("MODE err, not liberal nor strict")
+
+if config['INTRON']:
+    rule feature_count_gene_level:
+        input:
+            bams=expand("mapped_reads/{sample}.bam", sample=SAMPLES), # sort by name -> faster
+            exon_counts="feature_count/counts.s{strand}.strict.txt" if config["MODE"] == "strict" else "feature_count/counts.s{strand}.liberal.txt",
+            gtf=GTF
+        output:
+            COUNT='feature_count_gene_level/counts.s{strand}.gene_level.strict.txt' if config["MODE"] == "strict" else 'feature_count/counts.s{strand}.gene_level.liberal.txt',
+            summary="feature_count_gene_level/counts.s{strand}.gene_level.strict.txt.summary" if config["MODE"] == "strict" else "feature_count/counts.s{strand}.gene_level.liberal.txt.summary",
+        priority:
+            10
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 4000,
+        threads:
+            4
+        log:
+            "log/feature_count_gene_level/counts.s{strand}.gene_level.log"
+        benchmark:
+            "log/feature_count_gene_level/benchmark.s{strand}.gene_level.tsv"
+        run:
+            if config["PAIR_END"]:
+                if config["MODE"] == "strict":
+                    shell("""
+                    echo '>>> Gene-Count mode:' >> {log}
+                    featureCounts -a {input.gtf} -o {output.COUNT} \
+                    -T {threads} -t gene \
+                    -g gene_id -Q 20 --minOverlap 1 --fracOverlap 0 \
+                    -p -B -C  \
+                    -s {wildcards.strand} \
+                    {input.bams} &>> {log}
+                    """)
+                elif config["MODE"] == "liberal":
+                    shell("""
+                    echo '>>> Gene-Count mode:' >> {log}
+                    featureCounts -a {input.gtf} -o {output.COUNT} \
+                    -T {threads} -t gene \
+                    -g gene_id -M --primary -Q 0 --minOverlap 1 --fracOverlap 0 \
+                    -p \
+                    -s {wildcards.strand} \
+                    {input.bams} &>> {log}
+                    """)
+                else:
+                    print ("MODE err, not liberal nor strict")
+            else:
+                if config["MODE"] == "strict":
+                    shell("""
+                    echo '>>> Gene-Count mode:' >> {log}
+                    featureCounts -a {input.gtf} -o {output.COUNT} \
+                    -T {threads} -t gene \
+                    -g gene_id -Q 20 --minOverlap 1 --fracOverlap 0 \
+                    -s {wildcards.strand} \
+                    {input.bams} &>> {log}
+                    """)
+                elif config["MODE"] == "liberal":
+                    shell("""
+                    echo '>>> Gene-Count mode:' >> {log}
+                    featureCounts -a {input.gtf} -o {output.COUNT} \
+                    -T {threads} -t gene \
+                    -g gene_id -M --primary -Q 0 --minOverlap 1 --fracOverlap 0 \
+                    -s {wildcards.strand} \
+                    {input.bams} &>> {log}
+                    """)
+                else:
+                    print ("MODE err, not liberal nor strict")
+
+            shell("python workflow/script/get_max_of_featureCountsTable.py {input.exon_counts} {output.COUNT}")
+
+
+rule strand_detection:
+    input:
+        expand("feature_count/counts.s{strand}.strict.txt.summary", strand=STRAND) 
+        if config["MODE"] == "strict" 
+        else expand("feature_count/counts.s{strand}.liberal.txt.summary", strand=STRAND)
+    output:
+        "feature_count/counts.strict.txt" if config["MODE"] == "strict" else  "feature_count/counts.liberal.txt",
+        "meta/strandness.detected.txt"
+    threads:
+        1
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 1000
+    log:
+        "log/strand_detection.log"
+    benchmark:
+        "log/strand_detection.tsv"
+    script:
+        "script/strandness_detection.py"
+
+
+
+# rule SalmonTE_prep
+if config['PAIR_END']:
+    rule SalmonTE_prep:
+        input:
+            r1=expand("fastq/{sample}.R1.fastq.gz", sample=SAMPLES),
+            r2=expand("fastq/{sample}.R2.fastq.gz", sample=SAMPLES)    
+        output:
+            r1=expand("fastq_salmon/{sample}_1.fastq.gz", sample=SAMPLES),
+            r2=expand("fastq_salmon/{sample}_2.fastq.gz", sample=SAMPLES)
+        log:
+            "fastq_salmon/SalmonTE_prep.log"
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000
+        threads:
+            1
+        run:
+            for i,f in enumerate(input):
+                os.system("ln -s "+"../"+input[i] + " " + output[i])
+
+
+# rule SalmonTE
+if config['PAIR_END']:
+    rule SalmonTE:
+        # only start from Fastq
+        input:
+            r1=expand("fastq_salmon/{sample}_1.fastq.gz", sample=SAMPLES),
+            r2=expand("fastq_salmon/{sample}_2.fastq.gz", sample=SAMPLES)
+        output:
+            "SalmonTE_output/EXPR.csv"
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000,
+        params:
+            ref=config['TE_REFERENCE']
+        threads:
+            12
+        log:
+            'log/SalmonTE/salmonte_count.log'
+        benchmark:
+            'log/SalmonTE/salmonte_count.tsv'
+        shell:
+            """
+            which python &> {log}
+            python workflow/envs/SalmonTE/SalmonTE.py --version >> {log}
+            python workflow/envs/SalmonTE/SalmonTE.py quant \
+            --reference={params.ref} --exprtype=count \
+            --num_threads={threads} \
+            {input.r1} {input.r2} >> {log} 2>&1
+            """
+else:
+    rule SalmonTE:
+        # only start from Fastq
+        input:
+            r1=expand("fastq/{sample}.fastq.gz", sample=SAMPLES),
+        output:
+            "SalmonTE_output/EXPR.csv"
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 1000,
+        params:
+            ref=config['TE_REFERENCE']
+        threads:
+            12
+        log:
+            'log/SalmonTE/salmonte_count.se.log'
+        benchmark:
+            'log/SalmonTE/salmonte_count.se.tsv'
+        shell:
+            """
+            which python &> {log}
+            python workflow/envs/SalmonTE/SalmonTE.py --version >> {log}
+            python envs/SalmonTE/SalmonTE.py quant \
+            --reference={params.ref} --exprtype=count \
+            --num_threads={threads} \
+            {input.r1} >> {log} 2>&1
+            """
+
+rule Merge_TE_and_Gene:
+    input:
+        gene="feature_count/counts.strict.txt"
+            if config['MODE'] == 'strict'
+            else "feature_count/counts.liberal.txt",
+        te="SalmonTE_output/EXPR.csv"
+    output:
+        "feature_count/TE_included.txt"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 16000,
+    threads:
+        1
+    log:
+        "log/merge_te_and_gene/merge_te_and_gene.log"
+    benchmark:
+        "log/merge_te_and_gene/merge_te_and_gene.tsv"
+    shell:
+        """
+        python workflow/script/merge_featureCount_and_SalmonTE.py \
+        {input.gene} {input.te} {output} > {log} 2>&1
+        """
+
+
+
+
+
+rule DESeq2:
+# todo: use softlinked workflow/script/DESeq2.rmd, use softlinked example_data/ at COUNT-START
+    input:
+        cnt=DESeq2_input(config),
+        meta=config["META"],
+        contrast=config["CONTRAST_DE"],
+    output:
+        "DESeq2/DESeq2.html",
+        expand("DESeq2/rnk/{contrast}.rnk", contrast=CONTRASTS_DE)
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000,
+    params:
+        rmd="'workflow/script/DESeq2.Rmd'",
+        fdr=MAX_FDR,
+        lfc=MIN_LFC,
+        independentFilter=config["independentFilter"],
+        cooksCutoff=config["cooksCutoff"],
+        anno_tab=ANNO_TAB,
+        o="'../../DESeq2/DESeq2.html'"
+    priority: 
+        100
+    threads:
+        1
+    log:
+        "DESeq2/DESeq2.log"
+    benchmark:
+        "log/DESeq2/DESeq2.tsv"
+    shell:
+        #Rscript -e rmarkdown::render({params.rmd})
+        'cp workflow/script/DESeq2.Rmd DESeq2; '
+        'Rscript -e "rmarkdown::render({params.rmd}, \
+        params=list(max_fdr={params.fdr}, \
+        min_lfc={params.lfc}, \
+        cookscutoff={params.cooksCutoff}, \
+        indfilter={params.independentFilter}, \
+        countFile=\'../{input.cnt}\', \
+        annoFile=\'{params.anno_tab}\', \
+        metaFile=\'../{input.meta}\', \
+        contrastFile=\'../{input.contrast}\'           ), \
+        output_file={params.o})" > {log} 2>&1 ;'
+        'D=DESeq2; rm -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};'
+
+
+
+
+rule GSEA:
+    """
+    config[START] == RNK, then find config[RNKS], else, find {contrast} 
+    config[RNKS] contains the full name of the rank file (xlsx or txt), must be put in ./meta/ folder
+    rnk file must be named xxx.rnk.txt when feeded to GSEA
+
+    # todo: 
+    [x] no svg if nplots > 200 (yes)
+    [] 
+    """
+    input: 
+        deseq2= "Workflow_DAG.all.svg" # dummy assume existing
+            if config["START"] == "RNK"
+            else "DESeq2/DESeq2.html" , # DESEq2, then GSEA
+        rnk=lambda wildcards: input_rnk_fname1(wildcards, config),
+        db="meta/gsea_db/{db}",
+    output:
+        "gsea/{fname}/{db}.GseaPreranked/index.html"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 12000,
+    params:
+        svg=config["GSEA_PLOT_SVG"] if config["GSEA_NPLOTS"] <= 200 else False,  # no svg if nplots > 200 (to save time and space) # todo: move this to front end, when making workflow portable
+        nplot=config["GSEA_NPLOTS"],
+        label_db=lambda wildcards: wildcards["db"][:-12],
+        rnk_flat_file= lambda wildcards: input_rnk_fname2(wildcards, config),
+    threads:
+        1
+    log:
+        "log/gsea/{fname}.{db}.log"
+    benchmark:
+        "log/gsea/{fname}.{db}.tsv"
+    priority:
+        100
+    shell:
+        """
+        echo fname1: {input.rnk} > {log}
+        echo fname2: {params.rnk_flat_file} >> {log}
+        echo label_db: {params.label_db} >> {log}
+        echo wildcards.fname: {wildcards.fname} >> {log}
+        echo wildcards.db: {wildcards.db} >> {log}
+
+        mkdir -p gsea && mkdir -p gsea/{wildcards.fname} &>> {log}
+        rm -rf gsea/{wildcards.fname}/{wildcards.db}.GseaPreranked.*/  # avoid confusion
+        rm -rf gsea/{wildcards.fname}/{wildcards.db}.GseaPreranked/  # avoid dir structure mistake
+        rm -rf gsea/{wildcards.fname}/error_{wildcards.db}*GseaPreranked*/  # avoid confusion of temp files in multiple run attempts
+
+        python workflow/script/fix_gsea_input.py {input.rnk} &>> {log}  # fix gene symbol error; change test.xlsx to test.rnk.txt
+        
+        which java &>> {log}
+
+        if workflow/envs/GSEA_4.0.3/gsea-cli.sh GSEAPreranked \
+        -gmx {input.db} -rnk {params.rnk_flat_file} -rpt_label {wildcards.db} \
+        -norm meandiv -nperm 1000  -scoring_scheme classic \
+        -create_svgs {params.svg} -make_sets true  -rnd_seed timestamp -zip_report false \
+        -set_max 15000 -set_min 15 \
+        -plot_top_x {params.nplot} -out ./gsea/{wildcards.fname} &>> {log}
+        then
+            mv gsea/{wildcards.fname}/{wildcards.db}.GseaPreranked.*/ \
+            gsea/{wildcards.fname}/{wildcards.db}.GseaPreranked/  &>> {log} 
+        else
+            mv gsea/{wildcards.fname}/*{wildcards.db}.GseaPreranked*/ \
+            gsea/{wildcards.fname}/{wildcards.db}.GseaPreranked/  &>> {log}
+        fi
+    
+        cp workflow/envs/GSEA_MSigDB_ReadMe.html gsea/ &>> {log}
+
+        # compress
+        echo compress
+        D=gsea/{wildcards.fname}/{wildcards.db}.GseaPreranked
+        rm -f $D.zip && [ -d $D ] && zip -rq $D.zip $D/ &>> {log}
+        """
+
+# todo: if gsea/contrast/err_{db}, touch gsea/contrast/db.finished
+
+rule read_length_detection_bam:
+    input:
+        expand(rez+"/bam_qc/stats/{sample}.stats.txt", sample=SAMPLES)
+            if config['START'] in ["FASTQ", "BAM"]
+            else "BAM file not provided. AND can't be generated from FASTQ, because FASTQ not provided"
+    output:
+        "meta/read_length.txt"
+    resources:
+        mem_mb="1000",
+    threads:
+        1
+    log:
+        "log/read_length_detection_bam/read_length_detection_bam.log"
+    benchmark:
+        "log/read_length_detection_bam/read_length_detection_bam.tsv"
+    run:
+        import re
+        import statistics
+        lengths = []
+        for f in input:
+            p = re.compile("average length:\s*(\d*)")
+            for i, line in enumerate(open(f, "r")):
+                for match in re.finditer(p, line):
+                    lengths.append(match.group(1))
+        lengths = list(map(int, lengths))
+        print("read lengths detected from BAM:", lengths,"\n")
+        if(len(set(lengths)) < 1):
+            sys.exit("read lengths detection from BAM failed")
+        if(len(set(lengths)) > 1):
+            print("Not all fastq files have the same length, will give rMATS the median length")
+        
+        median_length = int(statistics.median(lengths))
+        print(output[0])
+        with open(output[0], "w") as out:
+            out.write(str(median_length))
+
+
+rule rMATS:
+    #todo: update to docker: simple to install, faster, recommended on website
+    input:
+        b1=lambda wildcards: B1S[int(wildcards['ascn'])-1],
+        b2=lambda wildcards: B2S[int(wildcards['ascn'])-1],
+        gtf=GTF, 
+        length_file="meta/read_length.txt" , 
+        strand_file="meta/strandness.detected.txt",
+    output:
+        "rMATS.{ascn}/output/Results_JunctionCountsBased/RI.MATS.JC.txt"
+    envmodules:
+        "rMATS/4.1.0 "
+        "gcc/8.1.0 " # must have space
+    conda:
+        "envs/rmats.yaml"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000,  # todo reduce
+    threads:
+        4
+    params:
+        b1=lambda wildcards: B1[int(wildcards['ascn'])-1], 
+        b2=lambda wildcards: B2[int(wildcards['ascn'])-1], 
+        type="paired" if config['PAIR_END'] else "single", 
+        analysis="P" if config['PAIR_END'] else "U", 
+        length=read_length("meta/read_length.txt"), 
+        strandness=get_strandness("meta/strandness.detected.txt", config),
+        MAX_FDR=MAX_FDR
+    log:
+        "log/rMATS/rMATS.{ascn}.log"
+    benchmark:
+        "log/rMATS/rMATS.{ascn}.tsv"
+    shell:
+        """
+        rm -rf rMATS.{wildcards.ascn}
+        mkdir -p rMATS.{wildcards.ascn}/
+        mkdir -p rMATS.{wildcards.ascn}/params/
+
+
+        echo {params.b1} > rMATS.{wildcards.ascn}/params/b1.txt
+        echo {params.b2} > rMATS.{wildcards.ascn}/params/b2.txt
+
+        which python &> {log}
+
+        rmats.py  \
+        --b1 rMATS.{wildcards.ascn}/params/b1.txt \
+        --b2  rMATS.{wildcards.ascn}/params/b2.txt \
+        --gtf {input.gtf} \
+        -t {params.type} \
+        --readLength {params.length} \
+        --variable-read-length \
+        --libType {params.strandness} \
+        --nthread {threads} \
+        --tstat {threads} \
+        --cstat 0.2 \
+        --od rMATS.{wildcards.ascn}/output/ \
+        --tmp rMATS.{wildcards.ascn}/tmp/  &>> {log}
+
+        cp workflow/envs/rMATS_ReadMe.html rMATS.{wildcards.ascn}/output/  &>>{log}
+
+        rm -rf rMATS.{wildcards.ascn}/tmp/   &>> {log}
+
+        mkdir -p rMATS.{wildcards.ascn}/output/Results_JunctionCountsBased/ &>> {log}
+        mkdir -p rMATS.{wildcards.ascn}/output/Results_JunctionCountsAndExonCountsBased/  &>> {log}
+        mkdir -p rMATS.{wildcards.ascn}/output/fromGTF/ &>> {log}
+        mv rMATS.{wildcards.ascn}/output/*JCEC.txt rMATS.{wildcards.ascn}/output/Results_JunctionCountsAndExonCountsBased/ &>> {log}
+        mv rMATS.{wildcards.ascn}/output/*JC.txt rMATS.{wildcards.ascn}/output/Results_JunctionCountsBased/ &>> {log}
+        mv rMATS.{wildcards.ascn}/output/fromGTF*txt  rMATS.{wildcards.ascn}/output/fromGTF/ &>> {log}
+        rm -f rMATS.{wildcards.ascn}/output/*raw.input* &>> {log}
+
+        D=rMATS.{wildcards.ascn};
+        rm -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};
+        """
+
+
+DEXSeq_GFF = config['GTF']+".dexseq.gff"
+
+rule DEXSeq_Prep_GFF:
+    input:
+        config['GTF']
+    output:
+        DEXSeq_GFF
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000
+    threads:
+        1
+    log:
+        "log/DEXSeq/prep_gff.log"
+    benchmark:
+        "log/DEXSeq/prep_gff.tsv"
+    shell:
+        "python workflow/script/dexseq_prepare_annotation.py -r no {input} {output} &> {log}"
+
+
+
+
+rule prep_count:
+    input:
+        bam="sorted_reads/{sample}.bam",
+        strandFile="meta/strandness.detected.txt", 
+        gff=DEXSeq_GFF
+    output:
+        "DEXSeq_count/{sample}_count.txt"
+    params:
+        strand=get_strandness_for_dexseq('meta/strandness.detected.txt'),
+        readType=('-p yes -r pos'
+            if config['PAIR_END']
+            else ' '), 
+        MAPQ=10
+    resources:
+         mem_mb=lambda wildcards, attempt: attempt * 16000
+    log:
+        "log/DEXSeq/prep_count.{sample}.log"
+    benchmark:
+        "log/DEXSeq/prep_count.{sample}.tsv"
+    shell:
+        "python workflow/script/dexseq_count.py -f bam -a {params.MAPQ} {params.readType} {params.strand} {DEXSeq_GFF} {input.bam} {output}"  
+        # todo: maybe -r name (sort by name) is faster
+
+
+rule DEXSeq:
+    input:
+        count_files = expand("DEXSeq_count/{sample}_count.txt", sample = SAMPLES),
+        meta=config["META"],
+        contrast=config["CONTRAST_AS"],
+        gffFile=config['GTF']+".dexseq.gff",
+        strandness="meta/strandness.detected.txt"
+    output:
+        "DEXSeq/contrast{ascn}/contrast{ascn}.RData"
+    resources:
+         mem_mb=lambda wildcards, attempt: attempt * 3000
+    threads:
+        12
+    params:
+        rmd="'workflow/script/dexseq.r'",
+        annoFile=config["ANNO_TAB"],
+    log:
+        "log/DEXSeq/DEXSeq.{ascn}.log"
+    benchmark:
+        "log/DEXSeq/DEXSeq.{ascn}.tsv"
+    shell:
+        """
+        mkdir -p DEXSeq 
+        which Rscript &> {log}
+        cp workflow/script/dexseq.r DEXSeq/ &>> {log}
+        Rscript workflow/script/dexseq.r {input.meta} {input.contrast} {input.gffFile} {params.annoFile} {MAX_FDR} {MIN_LFC} {threads} {MIN_GENE_COUNT} {wildcards.ascn} &>> {log}
+        D=DEXSeq/contrast{wildcards.ascn}
+        rm -f $D.zip && [ -d $D ] && zip -rq $D.zip $D/ &>> {log}
+        """
+
+rule genome_faidx:
+    input:
+        config['GENOME']
+    output:
+        config['GENOME']+'.fai'
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt *4000
+    threads:
+        1
+    log:
+        "log/genome_faidx/faidx.log"
+    shell:
+        "samtools faidx {input}  &> {log}"
+
+
+rule GATK_CreateSequenceDictionary:
+    input:
+        config['GENOME'],
+    output:
+        re.sub( "fa$", "dict", config['GENOME'])
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 16000
+    envmodules:
+        "java/1.8.0_171"
+    threads:
+        1
+    log:
+        "log/GATK_CreateSequenceDictionary/GATK_CreateSequenceDictionary.log"
+    benchmark:
+        "log/GATK_CreateSequenceDictionary/GATK_CreateSequenceDictionary.tsv"
+    shell:
+        "./workflow/envs/gatk-4.1.8.1/gatk CreateSequenceDictionary -R {input} &> {log}"
+
+
+rule GATK_ASEReadCounter:
+    input:
+        genome=config['GENOME'],
+        genome_idx=config['GENOME']+'.fai',
+        genome_ref=re.sub( "fa$", "dict", config['GENOME']),
+        bam="sorted_reads/{sample}.bam",
+        vcf=config['VCF']
+    output:
+        table="GATK_ASEReadCounter/{sample}.table"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 16000
+    envmodules:
+        "java/1.8.0_171"
+    threads:
+        1
+    log:
+        "log/GATK_ASEReadCounter/{sample}.log"
+    benchmark:
+        "log/GATK_ASEReadCounter/{sample}.tsv"
+    shell:
+        "./workflow/envs/gatk-4.1.8.1/gatk ASEReadCounter -R {input.genome} -I {input.bam} -V {input.vcf} -O {output} \
+        --min-depth-of-non-filtered-base 10 --min-mapping-quality 15 --min-base-quality 20 \
+        &> {log};"  # todo: more thoughts on detailed parameters, e.g.    -drf DuplicateRead -U ALLOW_N_CIGAR_READS
+        "D=GATK_ASEReadCounter; "
+        "rm -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};"
+
+
+rule hisat2_build:
+    """
+    guided by GTF
+    large RAM needed? More threads more RAM?
+    with only genome.fa, only takes ~6GB RAM, 20min
+    $ hisat2-build -p 16 genome.fa genome
+
+    with transcripts, takes 160GB RAM, 1h
+    $ hisat2-build -p 16 --exon genome.exon --ss genome.ss genome.fa genome_tran
+    http://daehwankimlab.github.io/hisat2/howto/
+    """
+    input:
+        genome=config['GENOME'],
+        gtf=config['GTF']
+    output:
+        ss=config['GTF']+"ss",
+        exon=config['GTF']+"exon",
+        index=config['GENOME'] + ".1.ht2",
+        flag=touch(config['GENOME'] + '.hisat2_build.finished')
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 24000
+    threads:
+        8
+    log:
+        "log/hisat2_build/hisat2_build.log"
+    benchmark:
+        "log/hisat2_build/hisat2_build.tsv"
+    shell:
+        """
+        hisat2_extract_splice_sites.py -v {input.gtf} > {output.ss} 2> {log}
+        hisat2_extract_exons.py -v {input.gtf} > {output.exon} 2>> {log}
+        hisat2-build -p {threads} \
+        {input.genome} {input.genome} --ss {output.ss} --exon {output.exon} 2>> {log}
+        """
+
+
+
+
+
+if config['PAIR_END']:
+    rule hisat2:
+        input:
+            genome=config['GENOME'],
+            index=config['GENOME'] + '.hisat2_build.finished',
+            R1="fastq/{sample}.R1.fastq.gz",
+            R2="fastq/{sample}.R2.fastq.gz",
+            strandness="meta/strandness.detected.txt"
+        output:
+            bam="hisat2/{sample}.bam",
+            bai="hisat2/{sample}.bam.bai"
+        params:
+            strand=get_strandness_for_hisat2_PE("meta/strandness.detected.txt")
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 2000
+        threads:
+            8
+        log:
+            "log/hisat2/{sample}.hisat2.log"
+        benchmark:
+            "log/hisat2/{sample}.hisat2.tsv"
+        shell:
+            """
+            hisat2 -x {input.genome} -p {threads} --dta-cufflinks \
+            -1 {input.R1} -2 {input.R2} \
+            --rna-strandness {params.strand} 2> {log} | \
+            samtools sort -@ 2 -o {output.bam}
+            samtools index {output.bam}
+            """
+else:
+    rule hisat2:
+        input:
+            index=config['GENOME'] + '.hisat2_build.finished',
+            U="fastq/{sample}.fastq.gz",
+            strandness="meta/strandness.detected.txt"
+        output:
+            bam="hisat2/{sample}.bam",
+            bai="hisat2/{sample}.bam.bai"
+        params:
+            strand=get_strandness_for_hisat2_SE("meta/strandness.detected.txt")
+        resources:
+            mem_mb=lambda wildcards, attempt: attempt * 2000
+        threads:
+            8
+        log:
+            "log/hisat2/{sample}.hisat2.log"
+        benchmark:
+            "log/hisat2/{sample}.hisat2.tsv"
+        shell:
+            """
+            hisat2 -x {input.genome} -p {threads} --dta-cufflinks \
+            -U {input.U} \
+            --rna-strandness {params.strand} 2> {log} | \
+            samtools sort -@ 2 -o {output.bam}
+            samtools index {output.bam}
+            """
+
+
+
+rule stringtie:  # todo: group level
+    input:
+        bam="hisat2/{sample}.bam",
+        gtf=config['GTF'],
+        strandness='meta/strandness.detected.txt'
+    output:
+        "stringtie/{sample}.stringtie.gtf"
+    params:
+        strand=get_strandness_for_stringtie('meta/strandness.detected.txt')
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000
+    threads:
+        4
+    log:
+        "log/stringtie/{sample}.stringtie.log"
+    benchmark:
+        "log/stringtie/{sample}.stringtie.tsv"
+    shell:
+        """
+        stringtie -G {input.gtf} {params.strand} -o {output} {input.bam} 2> {log}
+        """
+
+rule stringtie_merge:
+    input:
+        stringties=expand("stringtie/{sample}.stringtie.gtf", sample=SAMPLES),
+        gtf=config['GTF']
+    output:
+        "stringtie/stringtie.merged.gtf"
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 4000
+    threads:
+        4
+    log:
+        "log/stringtie/stringtie.merged.log"
+    benchmark:
+        "log/stringtie/stringtie.merged.tsv"
+    shell:
+        """
+        stringtie --merge -G {input.gtf} -o {output} {input.stringties} 2> {log}
+        """
+
+
+rule create_dag:
+    resources:
+        mem_mb=lambda wildcards, attempt: attempt * 1000,
+    threads:
+        1
+    output:
+        "Workflow_DAG.all.svg"
+    log:
+        "log/create_dag/Workflow_DAG.all.svg.log"
+    envmodules:
+        "graphviz/2.26.0"
+    shell:
+        "snakemake --dag targets > dag 2> {log};"
+        "which dot &>> {log};"
+        "cat dag|dot -Tsvg > {output} 2>> {log}"
+
+
+# rule organize_results:
+#     input:
+#         mapping=expand("mapped_reads/{sample}.bam", sample=config['SAMPLES']),
+#     output:
+#         touch("log/oranize_results.finished")
+#     params:
+#         mem_mb="1000"
+#     log:
+#         "log/organize_results.log"
+#     shell:
+#         "gzip -f mapped_reads/*.Unmapped.out.mate*"
+# 
+
+rule reset:
+    shell:
+        """
+        echo 'deleting files..'
+        rm -rf fastqc/ bam_qc/ mapped_reads/ sorted_reads/ bam_qc/ bigWig/ \
+        feature_count/ fastq_salmon SalmonTE_output/ DESeq2/ gsea/ gsea_compressed/ \
+        GATK_ASEReadCounter/ DEXSeq_count/  DEXSeq/ rMATS.*/ \
+        _STARgenome _STARtmp \
+        feature_count_gene_level hisat2 stringtie \
+        lsf.log Log.out nohup.out report.log report.html  dag Workflow_DAG.all.svg \
+        meta/strandness.detected.txt  meta/decoder.txt meta/read_length.txt
+        echo 'unlocking dir..'
+        snakemake -j 1 --unlock
+        """
+
