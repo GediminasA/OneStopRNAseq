@@ -172,7 +172,7 @@ rule targets:
             if config["START"] in ["FASTQ", "BAM"] and config["MODE"] == "liberal" and config['INTRON']
             else "Workflow_DAG.all.svg"),
 
-        DESeq2="DESeq2/DESeq2.html"
+        DESeq2=rez + "/DESeq2/DESeq2.html"
             if config["START"] in ["FASTQ", "BAM", "COUNT"] and config['DESEQ2_ANALYSIS']
             else "Workflow_DAG.all.svg",
 
@@ -937,40 +937,41 @@ rule DESeq2:
         meta=config["META"],
         contrast=config["CONTRAST_DE"],
     output:
-        "DESeq2/DESeq2.html",
-        expand("DESeq2/rnk/{contrast}.rnk", contrast=CONTRASTS_DE)
+        rez + "/DESeq2/DESeq2.html",
+        expand(rez + "/DESeq2/rnk/{contrast}.rnk", contrast=CONTRASTS_DE)
     resources:
         mem_mb=lambda wildcards, attempt: attempt * 4000,
     params:
-        rmd="'workflow/script/DESeq2.Rmd'",
+        rmd="'script/DESeq24dev.Rmd'",
         fdr=MAX_FDR,
         lfc=MIN_LFC,
         independentFilter=config["independentFilter"],
         cooksCutoff=config["cooksCutoff"],
         anno_tab=ANNO_TAB,
-        o="'../../DESeq2/DESeq2.html'"
+        o=rez
     priority: 
         100
     threads:
-        1
+        4
     log:
-        "DESeq2/DESeq2.log"
+        rez + "DESeq2/DESeq2.log"
     benchmark:
         "log/DESeq2/DESeq2.tsv"
     shell:
         #Rscript -e rmarkdown::render({params.rmd})
-        'cp workflow/script/DESeq2.Rmd DESeq2; '
-        'Rscript -e "rmarkdown::render({params.rmd}, \
+        """Rscript -e "rmarkdown::render({params.rmd}, \
         params=list(max_fdr={params.fdr}, \
         min_lfc={params.lfc}, \
         cookscutoff={params.cooksCutoff}, \
         indfilter={params.independentFilter}, \
-        countFile=\'../{input.cnt}\', \
+        countFile=\'{input.cnt}\', \
         annoFile=\'{params.anno_tab}\', \
-        metaFile=\'../{input.meta}\', \
-        contrastFile=\'../{input.contrast}\'           ), \
-        output_file={params.o})" > {log} 2>&1 ;'
-        'D=DESeq2; rm -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};'
+        metaFile=\'{input.meta}\', \
+        outputDir=\'{params.o}\', \
+        threads=\'{threads}\', \
+        contrastFile=\'{input.contrast}\'), \
+        output_file='../{output[0]}')" > {log} 2>&1 ;"""
+        #'iD=DESeq2; rm -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};'
 
 
 
@@ -988,7 +989,7 @@ rule GSEA:
     input: 
         deseq2= "Workflow_DAG.all.svg" # dummy assume existing
             if config["START"] == "RNK"
-            else "DESeq2/DESeq2.html" , # DESEq2, then GSEA
+            else rez + "DESeq2/DESeq2.html" , # DESEq2, then GSEA
         rnk=lambda wildcards: input_rnk_fname1(wildcards, config),
         db="meta/gsea_db/{db}",
     output:
