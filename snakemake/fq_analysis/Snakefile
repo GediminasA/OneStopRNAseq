@@ -128,7 +128,7 @@ rule targets:
     input:
         # 1. everything listed here will be produced by the pipeline
         # 2. feed {sample}
-        fastqc=("fastqc/multiqc_report.html" 
+        fastqc=(rez+"/fastqc/multiqc_report.html" 
             if config["START"] == "FASTQ" 
             else "Workflow_DAG.all.svg"),
 
@@ -216,8 +216,10 @@ if config["PAIR_END"]:
             r1="fastq/{sample}.R1.fastq.gz",
             r2="fastq/{sample}.R2.fastq.gz",
         output:
-            r1="fastqc/details/{sample}.R1_fastqc.html", 
-            r2="fastqc/details/{sample}.R2_fastqc.html" 
+            r1=rez + "/fastqc/details/{sample}.R1_fastqc.html", 
+            r2=rez + "/fastqc/details/{sample}.R2_fastqc.html" 
+        params:
+            out =rez 
         priority:
             10
         resources:
@@ -230,7 +232,7 @@ if config["PAIR_END"]:
             "log/fastqc/{sample}.tsv"
         shell:
             "which fastqc &> {log};"
-            "fastqc -t {threads} {input} -o fastqc/details &>> {log};"
+            "fastqc -t {threads} {input} -o {params.out}/fastqc/details &>> {log};"
 else:
     rule FastQC:
         # don't need input, if you agree on not checking them
@@ -238,7 +240,9 @@ else:
         input:
             r1="fastq/{sample}.fastq.gz" 
         output:
-            "fastqc/details/{sample}_fastqc.html"
+            rez + "/fastqc/details/{sample}_fastqc.html"
+        params:
+            out =rez 
         priority:
             10
         resources:
@@ -251,17 +255,19 @@ else:
             "log/fastqc/{sample}.tsv"
         shell:
             "which fastqc &> {log};"
-            "fastqc -t {threads} {input} -o fastqc/details &>> {log};"
+            "fastqc -t {threads} {input} -o {params.out}/fastqc/details &>> {log};"
 
 
 # rule MultiQC
 if config["PAIR_END"]:
     rule MultiQC:
         input:
-            r1=expand("fastqc/details/{sample}.R1_fastqc.html", sample=SAMPLES),
-            r2=expand("fastqc/details/{sample}.R2_fastqc.html", sample=SAMPLES) 
+            r1=expand(rez+"/fastqc/details/{sample}.R1_fastqc.html", sample=SAMPLES),
+            r2=expand(rez+"/fastqc/details/{sample}.R2_fastqc.html", sample=SAMPLES) 
         output:
-            "fastqc/multiqc_report.html"
+            rez+"/fastqc/multiqc_report.html"
+        params:
+            out = rez
         priority:
             10
         resources:
@@ -274,15 +280,16 @@ if config["PAIR_END"]:
             "log/multiqc/multiqc.tsv"
         shell:
             "which multiqc &> {log};"
-            "rm -rf fastqc/multiqc_data && multiqc fastqc/details -o fastqc &>> {log};"
-            "D=fastqc; rm  -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};"
+            "rm -rf {params.out}/fastqc/multiqc_data && multiqc {params.out}/fastqc/details -o {params.out}/fastqc &>> {log};"
 else:
     rule MultiQC:
         input:
-            r1=expand("fastqc/details/{sample}_fastqc.html", sample=SAMPLES),
-            r2=expand("fastqc/details/{sample}_fastqc.html", sample=SAMPLES), # trick snakemake to skip r2
+            r1=expand(rez + "/fastqc/details/{sample}_fastqc.html", sample=SAMPLES),
+            r2=expand(rez + "/fastqc/details/{sample}_fastqc.html", sample=SAMPLES), # trick snakemake to skip r2
         output:
-            "fastqc/multiqc_report.html"
+            "{params.out}/fastqc/multiqc_report.html"
+        params:
+            out = rez 
         priority:
             10
         resources:
@@ -295,8 +302,8 @@ else:
             "log/multiqc/multiqc.tsv"
         shell:
             "which multiqc &> {log};"
-            "rm -rf fastqc/multiqc_data && multiqc fastqc/details -o fastqc &>> {log};"
-            "D=fastqc; rm  -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};"
+            "rm -rf {params.out}/fastqc/multiqc_data && multiqc {params.out}/fastqc/details -o {params.out}/fastqc &>> {log};"
+            "D={params.out}/fastqc; rm  -f $D/$D.zip && [ -d $D ] && zip -rq  $D/$D.zip $D/ &>> {log};"
 
 
 rule star_idx:
