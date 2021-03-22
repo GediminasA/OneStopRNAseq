@@ -70,7 +70,9 @@ if (length(args) < 2){
     threads <- as.numeric(args[7])
     MIN_GENE_COUNT <- as.numeric(args[8])  # todo: from args
     idx_contrast <- as.numeric(args[9])  # index of contrast, e.g. 1,2,3
-    #countFile <-paste( unlist(args[4:length(args)]), collapse=' ')  
+    #countFile <-paste( unlist(args[4:length(args)]), collapse=' ')
+    outDirRoot <- (args[10]) 
+    countDir <- (args[11]) 
   }
 
 
@@ -85,20 +87,15 @@ paste("minLFC:", minLFC)
 paste("threads:", threads)
 paste("MIN_GENE_COUNT:", MIN_GENE_COUNT)
 paste("index of contrast:", idx_contrast)
-
-
-
-
-
-
-paste("idx_contrast:", idx_contrast )
-
+paste("Count files dir:", countDir)
+paste("Output root (project):", outDirRoot)
 
 BPPARAM = MulticoreParam(workers=threads) 
-outDir <- paste("./DEXSeq/contrast",idx_contrast,"/", sep="")
-dir.create( "./DEXSeq/", showWarnings = FALSE)
-dir.create( outDir, showWarnings = FALSE)
-
+outDirDEXseq <- paste(outDirRoot,"DEXSeq",sep="/")
+outDir <- paste(outDirRoot,"/DEXSeq/contrast",idx_contrast,"/", sep="")
+dir.create( outDirRoot, showWarnings = TRUE)
+dir.create( outDirDEXseq, showWarnings = TRUE)
+dir.create( outDir, showWarnings = TRUE)
 # Importing annotation from GitHub (must be raw, not zipped)
 getAnnotation <- function(urlpath) {
   tmp <- tempfile()
@@ -128,7 +125,7 @@ cat("\n\nreading contrastFile:\n")
 contrast.df <- readExcel(contrastFile)
 print(contrast.df)
 
-countFile <- paste('DEXSeq_count/', meta.df$SAMPLE_LABEL, "_count.txt", sep='')
+countFile <- paste(countDir,"/", meta.df$SAMPLE_LABEL, "_count.txt", sep='')
 print("countFile:")
 print(countFile)
 if (!all(file.exists(countFile))){
@@ -150,13 +147,13 @@ name2 <- gsub(" ", "", name2)
 name1 <- gsub(";$", "", name1)
 name2 <- gsub(";$", "", name2)
 name1s <- strsplit(name1, ";") [[1]]
+name1st <- strsplit(name1, ";")
 name2s <- strsplit(name2, ";") [[1]]
 name1 <- gsub(";", "_", name1)
 name2 <- gsub(";", "_", name2)
 name <- paste(name1, name2, sep = "_vs_")
 cat(paste("\n\n>>> for contrast", idx_contrast, ":", name, "\n"))
 cat(paste("name1:", name1, "\nname2", name2, "\n"))
-
 # create sampleTable
 sampleTable <- data.frame(
   row.names = meta.df$SAMPLE_LABEL,
@@ -164,7 +161,6 @@ sampleTable <- data.frame(
   batch     = meta.df$BATCH
 )
 sampleTable
-
 # filter sampleTable
 idx <- sampleTable$condition %in% c(name1s, name2s)
 sampleTableSubset <- sampleTable[idx,]
@@ -173,6 +169,7 @@ sampleTableSubset
 countFilesSubset
 
 # change condition names for complex condition contrast
+print(sampleTableSubset)
 if (length(name1s) > 1) {
   levels(sampleTableSubset$condition)[levels(sampleTableSubset$condition) %in% name1s] <-
     name1
@@ -188,14 +185,12 @@ if (length(name2s) > 1) {
 }
 sampleTableSubset
 
-
 # Print sampleTable:
 print('countFilesSubset:')
 print(countFilesSubset)
 cat("\nsampleTableSubset: \n")
 print(sampleTableSubset)
 cat("\n")
-
 # Read data
 print("reading data..")
 dxd <- DEXSeqDataSetFromHTSeq(
